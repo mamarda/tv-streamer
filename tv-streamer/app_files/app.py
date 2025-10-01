@@ -1,17 +1,22 @@
 import os
 import subprocess
-import shutil
-import glob
+from subprocess import Popen, PIPE
+import signal
 from datetime import datetime
+from typing import Generator
 
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask import (
+    Flask, render_template, request, redirect,
+    url_for, flash, jsonify, Response, abort
+)
 from google.cloud import storage
 from google.cloud.sql.connector import Connector
 
 from .models import db, Stream
 
+
 # -----------------------------------------------------------------------------
-# Flask app  (templates live one level up in ../templates)
+# Flask app (templates live in ../templates)
 # -----------------------------------------------------------------------------
 app = Flask(__name__, template_folder="../templates")
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-me")
@@ -46,50 +51,95 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"creator": getconn}
 
 db.init_app(app)
 with app.app_context():
-    db.create_all()  # requires tvuser to have CREATE on schema public
+    db.create_all()  # requires tvuser create privileges on schema public
 
 # -----------------------------------------------------------------------------
-# Google Cloud Storage
+# (Optional) GCS for channel photos
 # -----------------------------------------------------------------------------
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
-if not BUCKET_NAME:
-    raise RuntimeError("BUCKET_NAME env var is required.")
+_storage_client = storage.Client() if BUCKET_NAME else None
+_bucket = _storage_client.bucket(BUCKET_NAME) if BUCKET_NAME else None
 
-_storage_client = storage.Client()
-_bucket = _storage_client.bucket(BUCKET_NAME)
-
-def upload_to_gcs(file_path: str, stream_id: int, prefix: str) -> str:
-    blob = _bucket.blob(f"{stream_id}/{prefix}/{os.path.basename(file_path)}")
+def upload_photo_to_gcs(file_path: str, stream_id: int) -> str:
+    if not _bucket:
+        return ""
+    blob = _bucket.blob(f"{stream_id}/photos/{os.path.basename(file_path)}")
     blob.upload_from_filename(file_path)
-    blob.make_public()  # simple for demo; use signed URLs in production
+    blob.make_public()
     return blob.public_url
 
-def _max_index(names) -> int:
-    max_idx = 0
-    for name in names:
-        base = os.path.basename(name)
-        parts = base.split("_")
-        if len(parts) < 2:
-            continue
-        try:
-            max_idx = max(max_idx, int(parts[-1].split(".")[0]))
-        except ValueError:
-            pass
-    return max_idx
+# -----------------------------------------------------------------------------
+# MJPEG generator (FFmpeg → JPEG frames → multipart)
+# -----------------------------------------------------------------------------
+def mjpeg_generator(hls_url: str, width: int = 640, fps: int = 20, jpeg_quality: int = 6) -> Generator[bytes, None, None]:
+    """
+    Spawn ffmpeg to pull HLS, transcode video to a stream of JPEG frames (image2pipe),
+    and yield a multipart/x-mixed-replace stream at ~fps.
+    """
+    # Many IPTV endpoints require a UA + reconnect flags; tune as needed
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-re",  # real-time pacing
+        "-fflags", "nobuffer",
+        "-flags", "low_delay",
+        "-user_agent", "Mozilla/5.0",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "2",
+        "-i", hls_url,
+        "-an",  # no audio in MJPEG
+        "-vf", f"fps={fps},scale={width}:-1",
+        "-vcodec", "mjpeg",
+        "-q:v", str(jpeg_quality),   # 2(best)-31(worst); 6 is a good default
+        "-f", "image2pipe",
+        "-"
+    ]
 
-def list_assets(stream_id: int):
-    prefix = f"{stream_id}/"
-    blobs = list(_bucket.list_blobs(prefix=prefix))
+    proc: Popen = Popen(cmd, stdout=PIPE, stderr=PIPE, bufsize=0)
 
-    def idx(name: str) -> int:
+    boundary = b"--frame"
+    header_tmpl = b"\r\n".join([
+        boundary,
+        b"Content-Type: image/jpeg",
+        b"Content-Length: %d",
+        b"",
+        b""
+    ])  # final \r\n\r\n before payload
+
+    buf = bytearray()
+    try:
+        while True:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                # If ffmpeg died, surface stderr then stop
+                err = proc.stderr.read().decode("utf-8", "ignore")
+                if err:
+                    app.logger.error("FFmpeg exited: %s", err.strip())
+                break
+            buf.extend(chunk)
+            # Split on JPEG end-of-image marker 0xFFD9
+            while True:
+                eoi = buf.find(b"\xff\xd9")
+                if eoi == -1:
+                    break
+                frame = bytes(buf[:eoi + 2])
+                del buf[:eoi + 2]
+                yield header_tmpl % len(frame) + frame
+    except GeneratorExit:
+        pass
+    except Exception as e:
+        app.logger.exception("MJPEG generator error: %r", e)
+    finally:
         try:
-            return int(os.path.basename(name).split("_")[-1].split(".")[0])
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                proc.wait(timeout=3)
         except Exception:
-            return 0
-
-    frame_blobs = sorted((b for b in blobs if b.name.endswith(".webp")), key=lambda b: idx(b.name))
-    audio_blobs = sorted((b for b in blobs if b.name.endswith(".mp3")), key=lambda b: idx(b.name))
-    return [b.public_url for b in frame_blobs], [b.public_url for b in audio_blobs]
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -98,17 +148,6 @@ def list_assets(stream_id: int):
 def index():
     streams = Stream.query.order_by(Stream.id).all()
     return render_template("index.html", streams=streams)
-
-@app.route("/get_assets/<int:stream_id>")
-def get_assets_json(stream_id):
-    frames, audios = list_assets(stream_id)
-    return jsonify({"frames": frames, "audios": audios})
-
-@app.route("/streams/<int:stream_id>")
-def player(stream_id):
-    stream = Stream.query.get_or_404(stream_id)
-    frames, audios = list_assets(stream_id)
-    return render_template("player.html", stream=stream, frames=frames, audios=audios)
 
 @app.route("/admin")
 def admin_list():
@@ -126,16 +165,15 @@ def admin_add():
         db.session.add(stream)
         db.session.commit()
 
-        if photo and photo.filename:
+        if photo and photo.filename and _bucket:
             tmp = f"/tmp/{photo.filename}"
             photo.save(tmp)
-            stream.photo_url = upload_to_gcs(tmp, stream.id, "photos")
+            stream.photo_url = upload_photo_to_gcs(tmp, stream.id)
             db.session.commit()
             os.remove(tmp)
 
         flash("Stream added!", "success")
         return redirect(url_for("admin_list"))
-
     return render_template("admin_form.html", stream=None)
 
 @app.route("/admin/edit/<int:stream_id>", methods=["GET", "POST"])
@@ -144,19 +182,16 @@ def admin_edit(stream_id):
     if request.method == "POST":
         stream.name = request.form["name"].strip()
         stream.hls_url = request.form["hls_url"].strip()
-
         photo = request.files.get("photo")
-        if photo and photo.filename:
+        if photo and photo.filename and _bucket:
             tmp = f"/tmp/{photo.filename}"
             photo.save(tmp)
-            stream.photo_url = upload_to_gcs(tmp, stream.id, "photos")
+            stream.photo_url = upload_photo_to_gcs(tmp, stream.id)
             os.remove(tmp)
-
         stream.last_processed = datetime.utcnow()
         db.session.commit()
         flash("Stream updated!", "success")
         return redirect(url_for("admin_list"))
-
     return render_template("admin_form.html", stream=stream)
 
 @app.route("/admin/delete/<int:stream_id>")
@@ -166,74 +201,20 @@ def admin_delete(stream_id):
     flash("Stream deleted!", "info")
     return redirect(url_for("admin_list"))
 
-@app.route("/process/<int:stream_id>")
-def process_stream(stream_id):
-    """
-    Grab ~10s from HLS: frames (webp @20fps) + audio (mp3 segments), append indexes, upload to GCS.
-    Includes UA header and structured error reporting to avoid generic 500s.
-    """
+# ---- MJPEG endpoints ---------------------------------------------------------
+@app.route("/mjpeg/<int:stream_id>")
+def mjpeg(stream_id):
     stream = Stream.query.get_or_404(stream_id)
-    hls_url = stream.hls_url
+    gen = mjpeg_generator(stream.hls_url, width=640, fps=20, jpeg_quality=6)
+    return Response(gen, mimetype="multipart/x-mixed-replace; boundary=frame")
 
-    sid = str(stream_id)
-    tmp_frame_dir = f"/tmp/{sid}_frames"
-    tmp_audio_dir = f"/tmp/{sid}_audio"
-    os.makedirs(tmp_frame_dir, exist_ok=True)
-    os.makedirs(tmp_audio_dir, exist_ok=True)
+@app.route("/player/<int:stream_id>")
+def player(stream_id):
+    stream = Stream.query.get_or_404(stream_id)
+    # Provide HLS to the client so <audio> can play it (via hls.js on Chrome/Edge)
+    return render_template("player.html", stream=stream, hls_url=stream.hls_url)
 
-    # Determine current max indexes in GCS
-    existing = list(_bucket.list_blobs(prefix=f"{sid}/"))
-    existing_frames = [b.name for b in existing if b.name.endswith(".webp")]
-    existing_audio = [b.name for b in existing if b.name.endswith(".mp3")]
-    max_frame = _max_index(existing_frames)
-    max_audio = _max_index(existing_audio)
-
-    # Many HLS servers require a UA; keep capture short for quick tests
-    net_flags = ["-user_agent", "Mozilla/5.0", "-loglevel", "error"]
-
-    frame_cmd = [
-        "ffmpeg", "-y", *net_flags, "-i", hls_url, "-t", "10",
-        "-vf", "scale=480:-1,fps=20",
-        "-c:v", "libwebp", "-quality", "50", "-compression_level", "6",
-        "-start_number", str(max_frame + 1),
-        f"{tmp_frame_dir}/frame_%04d.webp",
-    ]
-    audio_cmd = [
-        "ffmpeg", "-y", *net_flags, "-i", hls_url, "-t", "10",
-        "-vn", "-c:a", "libmp3lame", "-b:a", "32k",
-        "-f", "segment", "-segment_time", "5",
-        "-segment_start_number", str(max_audio + 1),
-        f"{tmp_audio_dir}/audio_%03d.mp3",
-    ]
-
-    try:
-        subprocess.run(frame_cmd, capture_output=True, check=True)
-        subprocess.run(audio_cmd, capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
-        err = (e.stderr or b"").decode("utf-8", "ignore")
-        print("FFMPEG_ERROR:", err)
-        shutil.rmtree(tmp_frame_dir, ignore_errors=True)
-        shutil.rmtree(tmp_audio_dir, ignore_errors=True)
-        return jsonify({"error": "ffmpeg failed", "detail": err}), 500
-    except Exception as e:
-        print("PROCESS_ERROR:", repr(e))
-        shutil.rmtree(tmp_frame_dir, ignore_errors=True)
-        shutil.rmtree(tmp_audio_dir, ignore_errors=True)
-        return jsonify({"error": "processing failed", "detail": str(e)}), 500
-
-    # Upload to GCS
-    for fpath in sorted(glob.glob(f"{tmp_frame_dir}/*.webp")):
-        upload_to_gcs(fpath, stream_id, "frames")
-    for fpath in sorted(glob.glob(f"{tmp_audio_dir}/*.mp3")):
-        upload_to_gcs(fpath, stream_id, "audio")
-
-    shutil.rmtree(tmp_frame_dir, ignore_errors=True)
-    shutil.rmtree(tmp_audio_dir, ignore_errors=True)
-
-    stream.last_processed = datetime.utcnow()
-    db.session.commit()
-    return jsonify({"status": "Processed and appended ~10s chunk."})
-
+# ---- Health ------------------------------------------------------------------
 @app.route("/health")
 def health():
     return {"ok": True}, 200
