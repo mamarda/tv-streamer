@@ -3,7 +3,10 @@
 <h1>Streams</h1>
 <ul>
   {% for s in streams %}
-    <li>{{ s.name }} — <a href="{{ url_for('player', stream_id=s.id) }}">Play</a></li>
+    <li>
+      {{ s.name }} —
+      <a href="{{ url_for('player', stream_id=s.id) }}">Watch</a>
+    </li>
   {% endfor %}
 </ul>
 {% endblock %}
