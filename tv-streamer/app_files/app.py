@@ -7,7 +7,7 @@ from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from google.cloud import storage
 from sqlalchemy import create_engine
-from cloud_sql_python_connector import Connector
+from google.cloud.sql.connector import Connector
 
 from .models import db, Stream
 
