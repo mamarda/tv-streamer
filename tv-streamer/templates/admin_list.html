@@ -4,10 +4,11 @@
 <a href="{{ url_for('admin_add') }}">Add Stream</a>
 <ul>
 {% for s in streams %}
-  <li>{{ s.name }} — 
-      <a href="{{ url_for('admin_edit', stream_id=s.id) }}">Edit</a> |
-      <a href="{{ url_for('admin_delete', stream_id=s.id) }}">Delete</a> |
-      <a href="{{ url_for('process_stream', stream_id=s.id) }}">Process</a>
+  <li>
+    {{ s.name }} —
+    <a href="{{ url_for('player', stream_id=s.id) }}">Watch</a> |
+    <a href="{{ url_for('admin_edit', stream_id=s.id) }}">Edit</a> |
+    <a href="{{ url_for('admin_delete', stream_id=s.id) }}">Delete</a>
   </li>
 {% endfor %}
 </ul>
