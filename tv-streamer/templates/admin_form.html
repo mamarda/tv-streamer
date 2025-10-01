@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ 'Edit' if stream else 'Add' }} Stream</h1>
+<form method="POST" enctype="multipart/form-data">
+  <label>Name: <input type="text" name="name" value="{{ stream.name if stream else '' }}" required></label><br>
+  <label>HLS URL: <input type="text" name="hls_url" value="{{ stream.hls_url if stream else '' }}" required></label><br>
+  <label>Photo: <input type="file" name="photo"></label><br>
+  <button type="submit">Save</button>
+</form>
+<a href="{{ url_for('admin_list') }}">Back</a>
+{% endblock %}

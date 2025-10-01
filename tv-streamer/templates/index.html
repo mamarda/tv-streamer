@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Streams</h1>
+<ul>
+  {% for s in streams %}
+    <li>{{ s.name }} — <a href="{{ url_for('player', stream_id=s.id) }}">Play</a></li>
+  {% endfor %}
+</ul>
+{% endblock %}

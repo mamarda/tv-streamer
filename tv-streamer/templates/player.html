@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ stream.name }}</h1>
+<img id="frame" alt="frame" />
+<audio id="audio" controls></audio>
+<script>
+  const frames = {{ frames|tojson }};
+  const audios = {{ audios|tojson }};
+  const img = document.getElementById('frame');
+  const audio = document.getElementById('audio');
+
+  let i = 0;
+  function tick() {
+    if (!frames.length) return;
+    img.src = frames[i % frames.length];
+    i++;
+    setTimeout(tick, 50);
+  }
+  tick();
+
+  let ai = 0;
+  function playNext() {
+    if (ai >= audios.length) { ai = 0; }
+    audio.src = audios[ai++];
+    audio.play().catch(()=>{});
+  }
+  audio.addEventListener('ended', playNext);
+  if (audios.length) playNext();
+</script>
+{% endblock %}
