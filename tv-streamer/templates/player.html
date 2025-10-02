@@ -1,38 +1,62 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>{{ stream.name }}</h1>
-<img id="frame" alt="frame" style="max-width: 100%; display:block; margin-bottom:8px;" />
+<img id="frame" alt="frame" style="max-width:100%;display:block;margin-bottom:8px;" />
 <audio id="audio" controls></audio>
 <button id="startAudio" style="display:none;">Start audio</button>
 
 <script>
-  const frames = {{ frames|tojson }};
-  const audios = {{ audios|tojson }};
+  const streamId = {{ stream.id }};
+  let frames = {{ frames|tojson }};
+  let audios = {{ audios|tojson }};
+
   const img = document.getElementById('frame');
   const audio = document.getElementById('audio');
   const btn = document.getElementById('startAudio');
 
-  // crude 20 fps slideshow
+  // Simple 20fps slideshow; will automatically use any newly appended frames.
   let i = 0;
   function tick() {
-    if (!frames.length) return;
-    img.src = frames[i % frames.length];
-    i++;
-    setTimeout(tick, 50);
+    if (frames.length) {
+      img.src = frames[i % frames.length];
+      i++;
+    }
+    setTimeout(tick, 50); // ~20 fps
   }
   tick();
 
-  // chain mp3 segments
+  // Chain mp3 segments in order; will play newly appended items when available.
   let ai = 0;
   function playNext() {
     if (!audios.length) return;
     if (ai >= audios.length) { ai = 0; }
     audio.src = audios[ai++];
-    audio.play().catch(()=>{ /* ignore */ });
+    audio.play().catch(()=>{ /* autoplay might be blocked */ });
   }
   audio.addEventListener('ended', playNext);
 
-  // try autoplay; if blocked, show a button
+  // Poll the server for new assets every 5s and append them (no duplicates).
+  function dedupeAppend(target, incoming) {
+    const existing = new Set(target);
+    for (const u of incoming) if (!existing.has(u)) target.push(u);
+  }
+  async function poll() {
+    try {
+      const r = await fetch(`/get_assets/${streamId}`, { cache: 'no-store' });
+      if (r.ok) {
+        const data = await r.json();
+        const oldLenF = frames.length, oldLenA = audios.length;
+        dedupeAppend(frames, data.frames || []);
+        dedupeAppend(audios, data.audios || []);
+        // if audio was empty and we just got some, try to start
+        if (!oldLenA && audios.length) tryStart();
+      }
+    } catch {}
+    setTimeout(poll, 5000);
+  }
+  poll();
+
+  // Try autoplay; if blocked, show a button the user can click once.
   function tryStart() {
     if (!audios.length) return;
     playNext();
