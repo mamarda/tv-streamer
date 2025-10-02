@@ -1,34 +1,34 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>{{ stream.name }}</h1>
+<img id="frame" alt="frame" />
+<audio id="audio" controls></audio>
 
-<!-- MJPEG video -->
-<img id="mjpeg" src="{{ url_for('mjpeg', stream_id=stream.id) }}" style="max-width: 100%;">
-
-<!-- Audio from HLS (use hls.js outside Safari) -->
-<audio id="audio" controls style="width: 100%; margin-top: 8px;"></audio>
-
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
+  const frames = {{ frames|tojson }};
+  const audios = {{ audios|tojson }};
+  const img = document.getElementById('frame');
   const audio = document.getElementById('audio');
-  const hlsUrl = {{ hls_url|tojson }};
 
-  function playHlsAudio(url) {
-    if (audio.canPlayType('application/vnd.apple.mpegURL')) {
-      // Safari (native HLS)
-      audio.src = url;
-      audio.play().catch(()=>{});
-    } else if (window.Hls && window.Hls.isSupported()) {
-      const hls = new Hls({ enableWorker: true });
-      hls.loadSource(url);
-      hls.attachMedia(audio);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => audio.play().catch(()=>{}));
-    } else {
-      // Fallback: let browser try anyway
-      audio.src = url;
-      audio.play().catch(()=>{});
-    }
+  // crude 20 fps slideshow
+  let i = 0;
+  function tick() {
+    if (!frames.length) return;
+    img.src = frames[i % frames.length];
+    i++;
+    setTimeout(tick, 50);
   }
-  playHlsAudio(hlsUrl);
+  tick();
+
+  // chain mp3 segments
+  let ai = 0;
+  function playNext() {
+    if (!audios.length) return;
+    if (ai >= audios.length) { ai = 0; }
+    audio.src = audios[ai++];
+    audio.play().catch(()=>{});
+  }
+  audio.addEventListener('ended', playNext);
+  if (audios.length) playNext();
 </script>
 {% endblock %}
