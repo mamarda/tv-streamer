@@ -1,14 +1,16 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>{{ stream.name }}</h1>
-<img id="frame" alt="frame" />
+<img id="frame" alt="frame" style="max-width: 100%; display:block; margin-bottom:8px;" />
 <audio id="audio" controls></audio>
+<button id="startAudio" style="display:none;">Start audio</button>
 
 <script>
   const frames = {{ frames|tojson }};
   const audios = {{ audios|tojson }};
   const img = document.getElementById('frame');
   const audio = document.getElementById('audio');
+  const btn = document.getElementById('startAudio');
 
   // crude 20 fps slideshow
   let i = 0;
@@ -26,9 +28,21 @@
     if (!audios.length) return;
     if (ai >= audios.length) { ai = 0; }
     audio.src = audios[ai++];
-    audio.play().catch(()=>{});
+    audio.play().catch(()=>{ /* ignore */ });
   }
   audio.addEventListener('ended', playNext);
-  if (audios.length) playNext();
+
+  // try autoplay; if blocked, show a button
+  function tryStart() {
+    if (!audios.length) return;
+    playNext();
+    audio.play().then(() => {
+      btn.style.display = 'none';
+    }).catch(() => {
+      btn.style.display = 'inline-block';
+    });
+  }
+  btn.addEventListener('click', tryStart);
+  tryStart();
 </script>
 {% endblock %}
