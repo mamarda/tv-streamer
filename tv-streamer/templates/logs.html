@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Recent Logs</h1>
+<p>Newest first. This is per-container memory; refresh to update.</p>
+<table border="1" cellpadding="6" cellspacing="0">
+  <thead>
+    <tr>
+      <th>Time (UTC)</th>
+      <th>Level</th>
+      <th>Logger</th>
+      <th>Message</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for e in entries %}
+      <tr>
+        <td>{{ e.ts }}</td>
+        <td>{{ e.level }}</td>
+        <td>{{ e.logger }}</td>
+        <td style="white-space: pre-wrap">{{ e.message }}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
