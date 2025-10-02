@@ -17,8 +17,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app_files/ app_files/
 COPY templates/ templates/
 
-# Expose for Cloud Run
+# Cloud Run port
 ENV PORT=8080
 
-# Start with gunicorn; use module path (package import style)
+# Entrypoint
 CMD ["gunicorn", "-b", "0.0.0.0:8080", "app_files.app:app"]
