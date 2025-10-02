@@ -26,8 +26,9 @@ app = Flask(__name__, template_folder="../templates")
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-me")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-# Optional token to protect /logs endpoints
-LOG_VIEW_TOKEN = os.environ.get("LOG_VIEW_TOKEN")  # set in Cloud Run env vars (recommended)
+# Optional headers for HLS (set in Cloud Run env if your source requires them)
+HLS_USER_AGENT = os.environ.get("HLS_USER_AGENT", "Mozilla/5.0")
+HLS_REFERER = os.environ.get("HLS_REFERER")  # e.g. https://example.com
 
 # -----------------------------------------------------------------------------
 # Cloud SQL (Postgres) via Connector (pg8000)
@@ -77,6 +78,7 @@ _bucket = _storage_client.bucket(BUCKET_NAME)
 def upload_to_gcs(file_path: str, stream_id: int, prefix: str) -> str:
     """
     Upload a local file to GCS under {stream_id}/{prefix}/{file}, with correct Content-Type.
+    Assumes bucket allows public ACLs (PAP disabled, access control = fine-grained).
     """
     blob = _bucket.blob(f"{stream_id}/{prefix}/{os.path.basename(file_path)}")
 
@@ -127,12 +129,60 @@ def list_assets(stream_id: int):
     return [b.public_url for b in frame_blobs], [b.public_url for b in audio_blobs]
 
 # -----------------------------------------------------------------------------
+# Networking flags for ffmpeg/ffprobe
+# -----------------------------------------------------------------------------
+def _net_flags(for_probe: bool = False):
+    # Common flags
+    flags = ["-user_agent", HLS_USER_AGENT]
+    if HLS_REFERER:
+        flags += ["-headers", f"Referer: {HLS_REFERER}\r\n"]
+
+    # ffmpeg supports reconnect flags; ffprobe ignores them (harmless)
+    if not for_probe or for_probe:  # include always; harmless for ffprobe
+        flags += ["-reconnect", "1",
+                  "-reconnect_at_eof", "1",
+                  "-reconnect_streamed", "1",
+                  "-reconnect_delay_max", "5"]
+    return flags
+
+def _detect_audio_index(hls_url: str) -> int | None:
+    """Return first audio stream index using ffprobe, or None if not found."""
+    cmd = ["ffprobe", "-v", "error",
+           *_net_flags(for_probe=True),
+           "-select_streams", "a",
+           "-show_entries", "stream=index",
+           "-of", "csv=p=0",  # just the index numbers, one per line
+           hls_url]
+    try:
+        out = subprocess.run(cmd, capture_output=True, check=True, text=True, timeout=20)
+        lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+        indices = []
+        for ln in lines:
+            try:
+                indices.append(int(ln))
+            except ValueError:
+                pass
+        idx = min(indices) if indices else None
+        logger.info("ffprobe audio indices=%s picked=%s", indices, idx)
+        return idx
+    except subprocess.CalledProcessError as e:
+        logger.error("ffprobe failed: %s", (e.stderr or "").strip())
+    except Exception as e:
+        logger.exception("ffprobe exception: %s", repr(e))
+    return None
+
+# -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
 @app.route("/")
 def index():
     streams = Stream.query.order_by(Stream.id).all()
     return render_template("index.html", streams=streams)
+
+@app.route("/favicon.ico")
+def favicon():
+    # Stop noisy 404s in logs
+    return "", 204
 
 @app.route("/get_assets/<int:stream_id>")
 def get_assets_json(stream_id):
@@ -216,90 +266,119 @@ def process_stream(stream_id):
     os.makedirs(tmp_frame_dir, exist_ok=True)
     os.makedirs(tmp_audio_dir, exist_ok=True)
 
-    # Determine current max indexes in GCS
+    # Determine current max indexes in GCS to append
     existing = list(_bucket.list_blobs(prefix=f"{sid}/"))
     existing_frames = [b.name for b in existing if b.name.endswith(".webp")]
     existing_audio = [b.name for b in existing if b.name.endswith(".mp3")]
     max_frame = _max_index(existing_frames)
     max_audio = _max_index(existing_audio)
 
-    net_flags = ["-user_agent", "Mozilla/5.0", "-loglevel", "error"]
+    # Build network flags
+    net_flags = _net_flags()
 
+    # --- Frames: aim ~12s @20fps ≈ 240 frames
     frame_cmd = [
-        "ffmpeg", "-y", *net_flags, "-i", hls_url, "-t", "10",
+        "ffmpeg", "-y",
+        *net_flags,
+        "-i", hls_url,
+        "-t", "12",
         "-vf", "scale=480:-1,fps=20",
         "-c:v", "libwebp", "-quality", "50", "-compression_level", "6",
         "-start_number", str(max_frame + 1),
         f"{tmp_frame_dir}/frame_%04d.webp",
     ]
+
+    # --- Audio: detect audio stream, segment into two ~6s MP3s
+    audio_index = _detect_audio_index(hls_url)
     audio_cmd = [
-        "ffmpeg", "-y", *net_flags, "-i", hls_url, "-t", "10",
-        "-vn", "-c:a", "libmp3lame", "-b:a", "32k",
-        "-f", "segment", "-segment_time", "5",
+        "ffmpeg", "-y",
+        *net_flags,
+        "-i", hls_url,
+        "-t", "12",
+        "-vn",
+        "-c:a", "libmp3lame", "-b:a", "64k", "-ar", "44100",
+        "-f", "segment", "-segment_time", "6",
         "-segment_start_number", str(max_audio + 1),
         f"{tmp_audio_dir}/audio_%03d.mp3",
     ]
+    if audio_index is not None:
+        audio_cmd = [
+            "ffmpeg", "-y",
+            *net_flags,
+            "-i", hls_url,
+            "-t", "12",
+            "-map", f"0:a:{audio_index}",
+            "-vn",
+            "-c:a", "libmp3lame", "-b:a", "64k", "-ar", "44100",
+            "-f", "segment", "-segment_time", "6",
+            "-segment_start_number", str(max_audio + 1),
+            f"{tmp_audio_dir}/audio_%03d.mp3",
+        ]
 
+    # Run both; collect stderr on failure
     try:
         subprocess.run(frame_cmd, capture_output=True, check=True)
-        subprocess.run(audio_cmd, capture_output=True, check=True)
     except subprocess.CalledProcessError as e:
         err = (e.stderr or b"").decode("utf-8", "ignore")
-        logger.error("FFMPEG_ERROR stream_id=%s detail=%s", stream_id, err)
+        logger.error("FFMPEG_FRAME_ERROR: %s", err)
         shutil.rmtree(tmp_frame_dir, ignore_errors=True)
         shutil.rmtree(tmp_audio_dir, ignore_errors=True)
-        return jsonify({"error": "ffmpeg failed", "detail": err}), 500
-    except Exception as e:
-        logger.exception("PROCESS_ERROR stream_id=%s", stream_id)
-        shutil.rmtree(tmp_frame_dir, ignore_errors=True)
-        shutil.rmtree(tmp_audio_dir, ignore_errors=True)
-        return jsonify({"error": "processing failed", "detail": str(e)}), 500
+        return jsonify({"error": "ffmpeg frames failed", "detail": err}), 500
+
+    try:
+        subprocess.run(audio_cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError as e:
+        # Try a fallback without explicit -map
+        err1 = (e.stderr or b"").decode("utf-8", "ignore")
+        logger.warning("FFMPEG_AUDIO_PRIMARY_FAILED, retrying without -map: %s", err1)
+        alt_cmd = [
+            "ffmpeg", "-y",
+            *net_flags,
+            "-i", hls_url,
+            "-t", "12",
+            "-vn",
+            "-c:a", "libmp3lame", "-b:a", "64k", "-ar", "44100",
+            "-f", "segment", "-segment_time", "6",
+            "-segment_start_number", str(max_audio + 1),
+            f"{tmp_audio_dir}/audio_%03d.mp3",
+        ]
+        try:
+            subprocess.run(alt_cmd, capture_output=True, check=True)
+        except subprocess.CalledProcessError as e2:
+            err2 = (e2.stderr or b"").decode("utf-8", "ignore")
+            logger.error("FFMPEG_AUDIO_ERROR: %s", err2)
+            shutil.rmtree(tmp_frame_dir, ignore_errors=True)
+            shutil.rmtree(tmp_audio_dir, ignore_errors=True)
+            return jsonify({"error": "ffmpeg audio failed", "detail": err2, "first_error": err1}), 500
 
     # Upload to GCS with correct Content-Type
-    for fpath in sorted(glob.glob(f"{tmp_frame_dir}/*.webp")):
+    frame_paths = sorted(glob.glob(f"{tmp_frame_dir}/*.webp"))
+    audio_paths = sorted(glob.glob(f"{tmp_audio_dir}/*.mp3"))
+
+    uploaded_frames = 0
+    uploaded_audio = 0
+
+    for fpath in frame_paths:
         upload_to_gcs(fpath, stream_id, "frames")
-    for fpath in sorted(glob.glob(f"{tmp_audio_dir}/*.mp3")):
+        uploaded_frames += 1
+    for fpath in audio_paths:
         upload_to_gcs(fpath, stream_id, "audio")
+        uploaded_audio += 1
 
     shutil.rmtree(tmp_frame_dir, ignore_errors=True)
     shutil.rmtree(tmp_audio_dir, ignore_errors=True)
 
     stream.last_processed = datetime.utcnow()
     db.session.commit()
-    logger.info("PROCESS end stream_id=%s", stream_id)
-    return jsonify({"status": "Processed and appended ~10s chunk."})
 
-# --- simple in-app log viewer -------------------------------------------------
-
-def _check_logs_auth() -> bool:
-    if not LOG_VIEW_TOKEN:
-        return True  # no token set; page is open (not recommended for public)
-    return request.args.get("token") == LOG_VIEW_TOKEN
-
-@app.route("/logs")
-def logs_page():
-    if not _check_logs_auth():
-        return "Forbidden", 403
-    entries = memory_handler.get(200)
-    # newest first
-    entries = list(reversed(entries))
-    return render_template("logs.html", entries=entries)
-
-@app.route("/logs.json")
-def logs_json():
-    if not _check_logs_auth():
-        return jsonify({"error": "forbidden"}), 403
-    return jsonify(memory_handler.get(200))
-
-@app.route("/logs/clear")
-def logs_clear():
-    if not _check_logs_auth():
-        return "Forbidden", 403
-    memory_handler.clear()
-    return "OK", 200
+    logger.info("PROCESS end stream_id=%s uploaded_frames=%s uploaded_audio=%s", stream_id, uploaded_frames, uploaded_audio)
+    return jsonify({
+        "status": "OK",
+        "uploaded_frames": uploaded_frames,
+        "uploaded_audio": uploaded_audio
+    })
 
 # --- global error handler -----------------------------------------------------
-
 @app.errorhandler(Exception)
 def on_error(e):
     logger.exception("UNHANDLED %s %s", request.method, request.path)
