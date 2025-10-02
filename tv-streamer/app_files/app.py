@@ -47,7 +47,7 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"creator": getconn}
 
 db.init_app(app)
 with app.app_context():
-    db.create_all()  # requires tvuser to have CREATE on schema public
+    db.create_all()  # tvuser must have CREATE/USAGE on schema public
 
 # -----------------------------------------------------------------------------
 # Google Cloud Storage
