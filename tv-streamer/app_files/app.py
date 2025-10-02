@@ -132,26 +132,23 @@ def list_assets(stream_id: int):
 # Networking flags for ffmpeg/ffprobe
 # -----------------------------------------------------------------------------
 def _net_flags(for_probe: bool = False):
-    # Common flags
     flags = ["-user_agent", HLS_USER_AGENT]
     if HLS_REFERER:
         flags += ["-headers", f"Referer: {HLS_REFERER}\r\n"]
-
-    # ffmpeg supports reconnect flags; ffprobe ignores them (harmless)
-    if not for_probe or for_probe:  # include always; harmless for ffprobe
-        flags += ["-reconnect", "1",
-                  "-reconnect_at_eof", "1",
-                  "-reconnect_streamed", "1",
-                  "-reconnect_delay_max", "5"]
+    # reconnect flags (harmless for ffprobe)
+    flags += ["-reconnect", "1",
+              "-reconnect_at_eof", "1",
+              "-reconnect_streamed", "1",
+              "-reconnect_delay_max", "5"]
     return flags
 
-def _detect_audio_index(hls_url: str) -> int | None:
+def _detect_audio_index(hls_url: str):
     """Return first audio stream index using ffprobe, or None if not found."""
     cmd = ["ffprobe", "-v", "error",
            *_net_flags(for_probe=True),
            "-select_streams", "a",
            "-show_entries", "stream=index",
-           "-of", "csv=p=0",  # just the index numbers, one per line
+           "-of", "csv=p=0",
            hls_url]
     try:
         out = subprocess.run(cmd, capture_output=True, check=True, text=True, timeout=20)
@@ -183,6 +180,21 @@ def index():
 def favicon():
     # Stop noisy 404s in logs
     return "", 204
+
+@app.route("/logs")
+def logs_page():
+    entries = memory_handler.get(200)
+    entries = list(reversed(entries))  # newest first
+    return render_template("logs.html", entries=entries)
+
+@app.route("/logs.json")
+def logs_json():
+    return jsonify(memory_handler.get(200))
+
+@app.route("/logs/clear")
+def logs_clear():
+    memory_handler.clear()
+    return "OK", 200
 
 @app.route("/get_assets/<int:stream_id>")
 def get_assets_json(stream_id):
