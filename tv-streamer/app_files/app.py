@@ -10,6 +10,9 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from google.cloud import storage
 from google.cloud.sql.connector import Connector
 
+import google.auth
+from google.auth.transport.requests import Request
+
 from .logging_setup import configure_logging, memory_handler
 from .models import db, Stream
 
@@ -20,7 +23,7 @@ configure_logging()
 logger = logging.getLogger("tv-streamer")
 
 # -----------------------------------------------------------------------------
-# Flask app  (templates live one level up in ../templates)
+# Flask app (templates are ../templates)
 # -----------------------------------------------------------------------------
 app = Flask(__name__, template_folder="../templates")
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-me")
@@ -28,7 +31,7 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 # Optional HLS headers
 HLS_USER_AGENT = os.environ.get("HLS_USER_AGENT", "Mozilla/5.0")
-HLS_REFERER = os.environ.get("HLS_REFERER")  # e.g. https://example.com
+HLS_REFERER = os.environ.get("HLS_REFERER")
 
 # Tunables
 CAPTURE_SECONDS = int(os.environ.get("CAPTURE_SECONDS", "60"))
@@ -51,7 +54,6 @@ if not DB_PASS:
 logger.info("DB settings loaded (user=%s, db=%s, instance=%s)", DB_USER, DB_NAME, INSTANCE_CONNECTION_NAME)
 
 _connector = Connector()
-
 def getconn():
     return _connector.connect(
         INSTANCE_CONNECTION_NAME,
@@ -80,8 +82,23 @@ logger.info("Using bucket=%s", BUCKET_NAME)
 _storage_client = storage.Client()
 _bucket = _storage_client.bucket(BUCKET_NAME)
 
+# Keyless signing (IAM) config
+SIGNING_SERVICE_ACCOUNT = os.environ.get("SIGNING_SERVICE_ACCOUNT")
+if not SIGNING_SERVICE_ACCOUNT:
+    raise RuntimeError("Set SIGNING_SERVICE_ACCOUNT to your Cloud Run service account email.")
+
+# Get ADC and ensure it can fetch an access token (for IAM signBlob)
+_ADC, _ = google.auth.default(scopes=[
+    "https://www.googleapis.com/auth/iam",
+    "https://www.googleapis.com/auth/devstorage.read_only",
+])
+def _access_token() -> str:
+    if not _ADC.valid:
+        _ADC.refresh(Request())
+    return _ADC.token
+
 def _upload(file_path: str, dest_name: str) -> None:
-    """Upload file to bucket at dest_name with correct Content-Type. No ACL changes."""
+    """Upload file; no ACL changes (works with PAP/UBLA)."""
     blob = _bucket.blob(dest_name)
     ctype, _ = mimetypes.guess_type(file_path)
     if file_path.endswith(".webp"):
@@ -90,41 +107,33 @@ def _upload(file_path: str, dest_name: str) -> None:
         ctype = "audio/mpeg"
     if not ctype:
         ctype = "application/octet-stream"
-
     blob.cache_control = "public, max-age=3600"
     blob.upload_from_filename(file_path, content_type=ctype)
-    # NO make_public; works with PAP/UBLA
     logger.info("Uploaded name=%s type=%s size=%s", dest_name, ctype, os.path.getsize(file_path))
 
 def _sign(name: str, response_type: str | None = None) -> str:
-    """Return a V4 signed URL for GET on the given object name."""
+    """Return a V4 signed URL using IAM (no private key needed)."""
     blob = _bucket.blob(name)
-    params = {}
-    if response_type:
-        params["response_type"] = response_type
-    url = blob.generate_signed_url(
+    return blob.generate_signed_url(
         version="v4",
         method="GET",
         expiration=timedelta(seconds=SIGNED_URL_TTL_SECONDS),
         response_type=response_type,
+        service_account_email=SIGNING_SERVICE_ACCOUNT,
+        access_token=_access_token(),
     )
-    return url
 
 def _max_index(names) -> int:
-    max_idx = 0
+    m = 0
     for name in names:
-        base = os.path.basename(name)
-        parts = base.split("_")
-        if len(parts) < 2:
-            continue
         try:
-            max_idx = max(max_idx, int(parts[-1].split(".")[0]))
-        except ValueError:
+            m = max(m, int(os.path.basename(name).split("_")[-1].split(".")[0]))
+        except Exception:
             pass
-    return max_idx
+    return m
 
 def _list_names(stream_id: int):
-    """Return sorted object NAMES (not URLs) for frames and audio."""
+    """Return sorted object NAMES for frames and audio."""
     prefix = f"{stream_id}/"
     blobs = list(_bucket.list_blobs(prefix=prefix))
 
@@ -140,7 +149,6 @@ def _list_names(stream_id: int):
     return frame_names, audio_names
 
 def _list_signed(stream_id: int):
-    """Return signed URLs for current assets; URLs will refresh on each poll."""
     frames, audios = _list_names(stream_id)
     frame_urls = [_sign(n, "image/webp") for n in frames]
     audio_urls = [_sign(n, "audio/mpeg") for n in audios]
@@ -149,32 +157,23 @@ def _list_signed(stream_id: int):
 # -----------------------------------------------------------------------------
 # ffmpeg helpers
 # -----------------------------------------------------------------------------
-def _net_flags(for_probe: bool = False):
+def _net_flags():
     flags = ["-user_agent", HLS_USER_AGENT]
     if HLS_REFERER:
         flags += ["-headers", f"Referer: {HLS_REFERER}\r\n"]
-    flags += ["-reconnect", "1",
-              "-reconnect_at_eof", "1",
-              "-reconnect_streamed", "1",
-              "-reconnect_delay_max", "5"]
+    flags += ["-reconnect", "1", "-reconnect_at_eof", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
     return flags
 
 def _detect_audio_index(hls_url: str):
-    cmd = ["ffprobe", "-v", "error",
-           *_net_flags(for_probe=True),
-           "-select_streams", "a",
-           "-show_entries", "stream=index",
-           "-of", "csv=p=0",
-           hls_url]
+    cmd = ["ffprobe", "-v", "error", *_net_flags(), "-select_streams", "a",
+           "-show_entries", "stream=index", "-of", "csv=p=0", hls_url]
     try:
         out = subprocess.run(cmd, capture_output=True, check=True, text=True, timeout=20)
         lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
         indices = []
         for ln in lines:
-            try:
-                indices.append(int(ln))
-            except ValueError:
-                pass
+            try: indices.append(int(ln))
+            except ValueError: pass
         idx = min(indices) if indices else None
         logger.info("ffprobe audio indices=%s picked=%s", indices, idx)
         return idx
@@ -185,7 +184,6 @@ def _detect_audio_index(hls_url: str):
     return None
 
 def _capture_once(stream: Stream, duration: int) -> tuple[int, int]:
-    """Capture one chunk and upload; returns (frames_count, audio_count)."""
     hls_url = stream.hls_url
     sid = str(stream.id)
     tmp_frame_dir = f"/tmp/{sid}_frames"
@@ -197,68 +195,41 @@ def _capture_once(stream: Stream, duration: int) -> tuple[int, int]:
     max_frame = _max_index(frame_names)
     max_audio = _max_index(audio_names)
 
-    net_flags = _net_flags()
-
+    # Frames (20 fps → ~duration*20 webp)
     frame_cmd = [
-        "ffmpeg", "-y",
-        *net_flags,
-        "-i", hls_url,
-        "-t", str(duration),
-        "-vf", "scale=480:-1,fps=20",
-        "-c:v", "libwebp", "-quality", "50", "-compression_level", "6",
+        "ffmpeg", "-y", *_net_flags(), "-i", hls_url, "-t", str(duration),
+        "-vf", "scale=480:-1,fps=20", "-c:v", "libwebp", "-quality", "50", "-compression_level", "6",
         "-start_number", str(max_frame + 1),
         f"{tmp_frame_dir}/frame_%04d.webp",
     ]
 
+    # Audio (10s segments, map first audio if detectable)
     audio_index = _detect_audio_index(hls_url)
-    audio_cmd = [
-        "ffmpeg", "-y",
-        *net_flags,
-        "-i", hls_url,
-        "-t", str(duration),
-        "-vn",
-        "-c:a", "libmp3lame", "-b:a", "64k", "-ar", "44100",
+    base_audio_cmd = [
+        "ffmpeg", "-y", *_net_flags(), "-i", hls_url, "-t", str(duration),
+        "-vn", "-c:a", "libmp3lame", "-b:a", "64k", "-ar", "44100",
         "-f", "segment", "-segment_time", str(AUDIO_SEGMENT_SECONDS),
         "-segment_start_number", str(max_audio + 1),
         f"{tmp_audio_dir}/audio_%03d.mp3",
     ]
-    if audio_index is not None:
-        audio_cmd = [
-            "ffmpeg", "-y",
-            *net_flags,
-            "-i", hls_url,
-            "-t", str(duration),
-            "-map", f"0:a:{audio_index}",
-            "-vn",
-            "-c:a", "libmp3lame", "-b:a", "64k", "-ar", "44100",
-            "-f", "segment", "-segment_time", str(AUDIO_SEGMENT_SECONDS),
-            "-segment_start_number", str(max_audio + 1),
-            f"{tmp_audio_dir}/audio_%03d.mp3",
-        ]
+    audio_cmd = base_audio_cmd if audio_index is None else [
+        "ffmpeg", "-y", *_net_flags(), "-i", hls_url, "-t", str(duration),
+        "-map", f"0:a:{audio_index}",
+        "-vn", "-c:a", "libmp3lame", "-b:a", "64k", "-ar", "44100",
+        "-f", "segment", "-segment_time", str(AUDIO_SEGMENT_SECONDS),
+        "-segment_start_number", str(max_audio + 1),
+        f"{tmp_audio_dir}/audio_%03d.mp3",
+    ]
 
-    # Run
     subprocess.run(frame_cmd, capture_output=True, check=True)
     try:
         subprocess.run(audio_cmd, capture_output=True, check=True)
     except subprocess.CalledProcessError:
-        # Fallback without -map
-        alt = [
-            "ffmpeg", "-y",
-            *net_flags,
-            "-i", hls_url,
-            "-t", str(duration),
-            "-vn",
-            "-c:a", "libmp3lame", "-b:a", "64k", "-ar", "44100",
-            "-f", "segment", "-segment_time", str(AUDIO_SEGMENT_SECONDS),
-            "-segment_start_number", str(max_audio + 1),
-            f"{tmp_audio_dir}/audio_%03d.mp3",
-        ]
-        subprocess.run(alt, capture_output=True, check=True)
+        subprocess.run(base_audio_cmd, capture_output=True, check=True)
 
     # Upload
     frame_paths = sorted(glob.glob(f"{tmp_frame_dir}/*.webp"))
     audio_paths = sorted(glob.glob(f"{tmp_audio_dir}/*.mp3"))
-
     for f in frame_paths:
         _upload(f, f"{sid}/frames/{os.path.basename(f)}")
     for f in audio_paths:
@@ -266,7 +237,6 @@ def _capture_once(stream: Stream, duration: int) -> tuple[int, int]:
 
     shutil.rmtree(tmp_frame_dir, ignore_errors=True)
     shutil.rmtree(tmp_audio_dir, ignore_errors=True)
-
     return len(frame_paths), len(audio_paths)
 
 # -----------------------------------------------------------------------------
@@ -281,7 +251,6 @@ def index():
 def favicon():
     return "", 204
 
-# In-app log viewer
 @app.route("/logs")
 def logs_page():
     entries = memory_handler.get(200)
@@ -385,7 +354,6 @@ def process_stream(stream_id):
     logger.info("PROCESS end stream_id=%s uploaded_frames=%s uploaded_audio=%s", stream_id, f, a)
     return jsonify({"status": "OK", "uploaded_frames": f, "uploaded_audio": a})
 
-# Global error handler
 @app.errorhandler(Exception)
 def on_error(e):
     logger.exception("UNHANDLED %s %s", request.method, request.path)
