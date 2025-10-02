@@ -1,24 +1,37 @@
 import logging
 import sys
 import os
+import threading
+import re
+from datetime import datetime
+from collections import deque
 
-def configure_logging() -> None:
+# --- redaction helpers --------------------------------------------------------
+
+def _build_redaction_patterns() -> list[tuple[re.Pattern, str]]:
+    pats: list[tuple[re.Pattern, str]] = []
+
+    # redact known env var values if present in logs
+    for k in ("DB_PASS", "SECRET_KEY"):
+        v = os.getenv(k)
+        if v:
+            try:
+                pats.append((re.compile(re.escape(v)), f"[REDACTED_{k}]"))
+            except re.error:
+                pass
+
+    # redact generic key/value tokens in URLs or text
+    generic = [
+        r"(?i)(token|sig|signature|key|pass|password)=([^\s&#]+)",
+        r"(?i)Authorization:\s*Bearer\s+[A-Za-z0-9\-\._~\+\/]+=*",
+    ]
+    for pat in generic:
+        pats.append((re.compile(pat), r"\1=[REDACTED]"))
+
+    return pats
+
+
+class MemoryLogHandler(logging.Handler):
     """
-    Send structured app logs to stdout so Cloud Run/Cloud Logging capture them.
-    No extra GCP libraries needed.
-    """
-    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-
-    fmt = "%(asctime)s %(levelname)s %(name)s %(message)s"
-    handler = logging.StreamHandler(stream=sys.stdout)
-    handler.setFormatter(logging.Formatter(fmt))
-
-    root = logging.getLogger()
-    root.handlers.clear()
-    root.addHandler(handler)
-    root.setLevel(level)
-
-    # Make sure Gunicorn loggers are not overly chatty but still visible
-    logging.getLogger("gunicorn.error").setLevel(level)
-    logging.getLogger("gunicorn.access").setLevel(level)
+    In-memory ring buffer of recent log lines.
+    NOTE: Per-instance
