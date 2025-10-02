@@ -3,13 +3,21 @@ import subprocess
 import shutil
 import glob
 import mimetypes
+import logging
 from datetime import datetime
 
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from google.cloud import storage
 from google.cloud.sql.connector import Connector
 
+from .logging_setup import configure_logging
 from .models import db, Stream
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+configure_logging()
+logger = logging.getLogger("tv-streamer")
 
 # -----------------------------------------------------------------------------
 # Flask app  (templates live one level up in ../templates)
@@ -31,6 +39,8 @@ if not INSTANCE_CONNECTION_NAME:
 if not DB_PASS:
     raise RuntimeError("DB_PASS env var is required (map Secret Manager secret as env var).")
 
+logger.info("DB settings loaded (user=%s, db=%s, instance=%s)", DB_USER, DB_NAME, INSTANCE_CONNECTION_NAME)
+
 _connector = Connector()
 
 def getconn():
@@ -48,6 +58,7 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"creator": getconn}
 db.init_app(app)
 with app.app_context():
     db.create_all()  # tvuser must have CREATE/USAGE on schema public
+    logger.info("Ensured DB tables exist")
 
 # -----------------------------------------------------------------------------
 # Google Cloud Storage
@@ -55,6 +66,7 @@ with app.app_context():
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
 if not BUCKET_NAME:
     raise RuntimeError("BUCKET_NAME env var is required.")
+logger.info("Using bucket=%s", BUCKET_NAME)
 
 _storage_client = storage.Client()
 _bucket = _storage_client.bucket(BUCKET_NAME)
@@ -75,13 +87,11 @@ def upload_to_gcs(file_path: str, stream_id: int, prefix: str) -> str:
         ctype = "application/octet-stream"
 
     blob.upload_from_filename(file_path, content_type=ctype)
-
-    # Cache for 1 hour (optional)
     blob.cache_control = "public, max-age=3600"
     blob.patch()
-
-    # Public for demo (consider signed URLs in production)
     blob.make_public()
+
+    logger.info("Uploaded to GCS url=%s content_type=%s size=%s", blob.public_url, ctype, os.path.getsize(file_path))
     return blob.public_url
 
 def _max_index(names) -> int:
@@ -109,6 +119,8 @@ def list_assets(stream_id: int):
 
     frame_blobs = sorted((b for b in blobs if b.name.endswith(".webp")), key=lambda b: idx(b.name))
     audio_blobs = sorted((b for b in blobs if b.name.endswith(".mp3")), key=lambda b: idx(b.name))
+
+    logger.info("Listed assets stream_id=%s frames=%s audio=%s", stream_id, len(frame_blobs), len(audio_blobs))
     return [b.public_url for b in frame_blobs], [b.public_url for b in audio_blobs]
 
 # -----------------------------------------------------------------------------
@@ -145,6 +157,7 @@ def admin_add():
         stream = Stream(name=name, hls_url=hls_url)
         db.session.add(stream)
         db.session.commit()
+        logger.info("Added stream id=%s name=%s", stream.id, stream.name)
 
         if photo and photo.filename:
             tmp = f"/tmp/{photo.filename}"
@@ -174,6 +187,7 @@ def admin_edit(stream_id):
 
         stream.last_processed = datetime.utcnow()
         db.session.commit()
+        logger.info("Updated stream id=%s", stream.id)
         flash("Stream updated!", "success")
         return redirect(url_for("admin_list"))
 
@@ -183,17 +197,15 @@ def admin_edit(stream_id):
 def admin_delete(stream_id):
     Stream.query.filter_by(id=stream_id).delete()
     db.session.commit()
+    logger.info("Deleted stream id=%s", stream_id)
     flash("Stream deleted!", "info")
     return redirect(url_for("admin_list"))
 
 @app.route("/process/<int:stream_id>")
 def process_stream(stream_id):
-    """
-    Grab ~10s from HLS: frames (webp @20fps) + audio (mp3 segments), append indexes, upload to GCS.
-    Includes UA header and structured error reporting.
-    """
     stream = Stream.query.get_or_404(stream_id)
     hls_url = stream.hls_url
+    logger.info("PROCESS start stream_id=%s url=%s", stream_id, hls_url)
 
     sid = str(stream_id)
     tmp_frame_dir = f"/tmp/{sid}_frames"
@@ -208,7 +220,6 @@ def process_stream(stream_id):
     max_frame = _max_index(existing_frames)
     max_audio = _max_index(existing_audio)
 
-    # Many HLS servers require a UA; keep capture short for quick tests
     net_flags = ["-user_agent", "Mozilla/5.0", "-loglevel", "error"]
 
     frame_cmd = [
@@ -231,12 +242,12 @@ def process_stream(stream_id):
         subprocess.run(audio_cmd, capture_output=True, check=True)
     except subprocess.CalledProcessError as e:
         err = (e.stderr or b"").decode("utf-8", "ignore")
-        print("FFMPEG_ERROR:", err)
+        logger.error("FFMPEG_ERROR stream_id=%s detail=%s", stream_id, err)
         shutil.rmtree(tmp_frame_dir, ignore_errors=True)
         shutil.rmtree(tmp_audio_dir, ignore_errors=True)
         return jsonify({"error": "ffmpeg failed", "detail": err}), 500
     except Exception as e:
-        print("PROCESS_ERROR:", repr(e))
+        logger.exception("PROCESS_ERROR stream_id=%s", stream_id)
         shutil.rmtree(tmp_frame_dir, ignore_errors=True)
         shutil.rmtree(tmp_audio_dir, ignore_errors=True)
         return jsonify({"error": "processing failed", "detail": str(e)}), 500
@@ -252,7 +263,14 @@ def process_stream(stream_id):
 
     stream.last_processed = datetime.utcnow()
     db.session.commit()
+    logger.info("PROCESS end stream_id=%s", stream_id)
     return jsonify({"status": "Processed and appended ~10s chunk."})
+
+@app.errorhandler(Exception)
+def on_error(e):
+    # Catch any uncaught exceptions and log full traceback
+    logger.exception("UNHANDLED %s %s", request.method, request.path)
+    return "Internal Server Error", 500
 
 @app.route("/health")
 def health():
