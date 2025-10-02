@@ -10,7 +10,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from google.cloud import storage
 from google.cloud.sql.connector import Connector
 
-from .logging_setup import configure_logging
+from .logging_setup import configure_logging, memory_handler
 from .models import db, Stream
 
 # -----------------------------------------------------------------------------
@@ -25,6 +25,9 @@ logger = logging.getLogger("tv-streamer")
 app = Flask(__name__, template_folder="../templates")
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-me")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# Optional token to protect /logs endpoints
+LOG_VIEW_TOKEN = os.environ.get("LOG_VIEW_TOKEN")  # set in Cloud Run env vars (recommended)
 
 # -----------------------------------------------------------------------------
 # Cloud SQL (Postgres) via Connector (pg8000)
@@ -266,9 +269,39 @@ def process_stream(stream_id):
     logger.info("PROCESS end stream_id=%s", stream_id)
     return jsonify({"status": "Processed and appended ~10s chunk."})
 
+# --- simple in-app log viewer -------------------------------------------------
+
+def _check_logs_auth() -> bool:
+    if not LOG_VIEW_TOKEN:
+        return True  # no token set; page is open (not recommended for public)
+    return request.args.get("token") == LOG_VIEW_TOKEN
+
+@app.route("/logs")
+def logs_page():
+    if not _check_logs_auth():
+        return "Forbidden", 403
+    entries = memory_handler.get(200)
+    # newest first
+    entries = list(reversed(entries))
+    return render_template("logs.html", entries=entries)
+
+@app.route("/logs.json")
+def logs_json():
+    if not _check_logs_auth():
+        return jsonify({"error": "forbidden"}), 403
+    return jsonify(memory_handler.get(200))
+
+@app.route("/logs/clear")
+def logs_clear():
+    if not _check_logs_auth():
+        return "Forbidden", 403
+    memory_handler.clear()
+    return "OK", 200
+
+# --- global error handler -----------------------------------------------------
+
 @app.errorhandler(Exception)
 def on_error(e):
-    # Catch any uncaught exceptions and log full traceback
     logger.exception("UNHANDLED %s %s", request.method, request.path)
     return "Internal Server Error", 500
 
