@@ -4,7 +4,7 @@ import shutil
 import glob
 import mimetypes
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from google.cloud import storage
@@ -33,6 +33,7 @@ HLS_REFERER = os.environ.get("HLS_REFERER")  # e.g. https://example.com
 # Tunables
 CAPTURE_SECONDS = int(os.environ.get("CAPTURE_SECONDS", "60"))
 AUDIO_SEGMENT_SECONDS = int(os.environ.get("AUDIO_SEGMENT_SECONDS", "10"))
+SIGNED_URL_TTL_SECONDS = int(os.environ.get("SIGNED_URL_TTL_SECONDS", "3600"))
 
 # -----------------------------------------------------------------------------
 # Cloud SQL (Postgres) via Connector (pg8000)
@@ -79,8 +80,9 @@ logger.info("Using bucket=%s", BUCKET_NAME)
 _storage_client = storage.Client()
 _bucket = _storage_client.bucket(BUCKET_NAME)
 
-def upload_to_gcs(file_path: str, stream_id: int, prefix: str) -> str:
-    blob = _bucket.blob(f"{stream_id}/{prefix}/{os.path.basename(file_path)}")
+def _upload(file_path: str, dest_name: str) -> None:
+    """Upload file to bucket at dest_name with correct Content-Type. No ACL changes."""
+    blob = _bucket.blob(dest_name)
     ctype, _ = mimetypes.guess_type(file_path)
     if file_path.endswith(".webp"):
         ctype = "image/webp"
@@ -88,12 +90,25 @@ def upload_to_gcs(file_path: str, stream_id: int, prefix: str) -> str:
         ctype = "audio/mpeg"
     if not ctype:
         ctype = "application/octet-stream"
-    blob.upload_from_filename(file_path, content_type=ctype)
+
     blob.cache_control = "public, max-age=3600"
-    blob.patch()
-    blob.make_public()
-    logger.info("Uploaded url=%s type=%s size=%s", blob.public_url, ctype, os.path.getsize(file_path))
-    return blob.public_url
+    blob.upload_from_filename(file_path, content_type=ctype)
+    # NO make_public; works with PAP/UBLA
+    logger.info("Uploaded name=%s type=%s size=%s", dest_name, ctype, os.path.getsize(file_path))
+
+def _sign(name: str, response_type: str | None = None) -> str:
+    """Return a V4 signed URL for GET on the given object name."""
+    blob = _bucket.blob(name)
+    params = {}
+    if response_type:
+        params["response_type"] = response_type
+    url = blob.generate_signed_url(
+        version="v4",
+        method="GET",
+        expiration=timedelta(seconds=SIGNED_URL_TTL_SECONDS),
+        response_type=response_type,
+    )
+    return url
 
 def _max_index(names) -> int:
     max_idx = 0
@@ -108,7 +123,8 @@ def _max_index(names) -> int:
             pass
     return max_idx
 
-def list_assets(stream_id: int):
+def _list_names(stream_id: int):
+    """Return sorted object NAMES (not URLs) for frames and audio."""
     prefix = f"{stream_id}/"
     blobs = list(_bucket.list_blobs(prefix=prefix))
 
@@ -118,10 +134,17 @@ def list_assets(stream_id: int):
         except Exception:
             return 0
 
-    frame_blobs = sorted((b for b in blobs if b.name.endswith(".webp")), key=lambda b: idx(b.name))
-    audio_blobs = sorted((b for b in blobs if b.name.endswith(".mp3")), key=lambda b: idx(b.name))
-    logger.info("Listed assets stream_id=%s frames=%s audio=%s", stream_id, len(frame_blobs), len(audio_blobs))
-    return [b.public_url for b in frame_blobs], [b.public_url for b in audio_blobs]
+    frame_names = sorted((b.name for b in blobs if b.name.endswith(".webp")), key=idx)
+    audio_names = sorted((b.name for b in blobs if b.name.endswith(".mp3")), key=idx)
+    logger.info("Listed assets stream_id=%s frames=%s audio=%s", stream_id, len(frame_names), len(audio_names))
+    return frame_names, audio_names
+
+def _list_signed(stream_id: int):
+    """Return signed URLs for current assets; URLs will refresh on each poll."""
+    frames, audios = _list_names(stream_id)
+    frame_urls = [_sign(n, "image/webp") for n in frames]
+    audio_urls = [_sign(n, "audio/mpeg") for n in audios]
+    return frame_urls, audio_urls
 
 # -----------------------------------------------------------------------------
 # ffmpeg helpers
@@ -170,11 +193,9 @@ def _capture_once(stream: Stream, duration: int) -> tuple[int, int]:
     os.makedirs(tmp_frame_dir, exist_ok=True)
     os.makedirs(tmp_audio_dir, exist_ok=True)
 
-    existing = list(_bucket.list_blobs(prefix=f"{sid}/"))
-    existing_frames = [b.name for b in existing if b.name.endswith(".webp")]
-    existing_audio = [b.name for b in existing if b.name.endswith(".mp3")]
-    max_frame = _max_index(existing_frames)
-    max_audio = _max_index(existing_audio)
+    frame_names, audio_names = _list_names(stream.id)
+    max_frame = _max_index(frame_names)
+    max_audio = _max_index(audio_names)
 
     net_flags = _net_flags()
 
@@ -219,8 +240,8 @@ def _capture_once(stream: Stream, duration: int) -> tuple[int, int]:
     subprocess.run(frame_cmd, capture_output=True, check=True)
     try:
         subprocess.run(audio_cmd, capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
-        # Fallback without -map in case the probed index is wrong/volatile
+    except subprocess.CalledProcessError:
+        # Fallback without -map
         alt = [
             "ffmpeg", "-y",
             *net_flags,
@@ -239,9 +260,9 @@ def _capture_once(stream: Stream, duration: int) -> tuple[int, int]:
     audio_paths = sorted(glob.glob(f"{tmp_audio_dir}/*.mp3"))
 
     for f in frame_paths:
-        upload_to_gcs(f, stream.id, "frames")
+        _upload(f, f"{sid}/frames/{os.path.basename(f)}")
     for f in audio_paths:
-        upload_to_gcs(f, stream.id, "audio")
+        _upload(f, f"{sid}/audio/{os.path.basename(f)}")
 
     shutil.rmtree(tmp_frame_dir, ignore_errors=True)
     shutil.rmtree(tmp_audio_dir, ignore_errors=True)
@@ -277,13 +298,13 @@ def logs_clear():
 
 @app.route("/get_assets/<int:stream_id>")
 def get_assets_json(stream_id):
-    frames, audios = list_assets(stream_id)
+    frames, audios = _list_signed(stream_id)
     return jsonify({"frames": frames, "audios": audios})
 
 @app.route("/streams/<int:stream_id>")
 def player(stream_id):
     stream = Stream.query.get_or_404(stream_id)
-    frames, audios = list_assets(stream_id)
+    frames, audios = _list_signed(stream_id)
     return render_template("player.html", stream=stream, frames=frames, audios=audios)
 
 @app.route("/admin")
@@ -306,7 +327,7 @@ def admin_add():
         if photo and photo.filename:
             tmp = f"/tmp/{photo.filename}"
             photo.save(tmp)
-            stream.photo_url = upload_to_gcs(tmp, stream.id, "photos")
+            _upload(tmp, f"{stream.id}/photos/{os.path.basename(tmp)}")
             db.session.commit()
             os.remove(tmp)
 
@@ -326,7 +347,7 @@ def admin_edit(stream_id):
         if photo and photo.filename:
             tmp = f"/tmp/{photo.filename}"
             photo.save(tmp)
-            stream.photo_url = upload_to_gcs(tmp, stream.id, "photos")
+            _upload(tmp, f"{stream.id}/photos/{os.path.basename(tmp)}")
             os.remove(tmp)
 
         stream.last_processed = datetime.utcnow()
